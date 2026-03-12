@@ -1,4 +1,4 @@
- """
+hi """
 iVAS Setup Bot — Telegram Version
 ===================================
 This bot runs on Render/Railway as a WEB SERVICE.
@@ -28,7 +28,7 @@ from telegram.error import TelegramError
 # ══════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════
-SETUP_BOT_TOKEN = "8291963800:AAErU7MDzn-hPrL_1D69TDgMdp949XrzeOY"  # Same bot token
+SETUP_BOT_TOKEN = "8405583459:AAGEEjYbHHEzzXg4dVzdrzkjOgV0dsAp-f0"  # Same bot token
 ADMIN_ID        = "7578254597"
 PORT            = int(os.getenv("PORT", 5000))
 # Your Render URL — update this after first deploy
