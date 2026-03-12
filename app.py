@@ -1,4 +1,4 @@
-hi """
+"""
 iVAS Setup Bot — Telegram Version
 ===================================
 This bot runs on Render/Railway as a WEB SERVICE.
