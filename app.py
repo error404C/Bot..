@@ -1,260 +1,349 @@
-import logging
+ """
+iVAS Setup Bot — Telegram Version
+===================================
+This bot runs on Render/Railway as a WEB SERVICE.
+It gives you a login link, you login to iVAS through it,
+and it sends you config.json directly on Telegram.
+
+HOW TO USE:
+1. Deploy this as a Web Service on Render
+2. Message the bot /setup on Telegram
+3. Bot sends you a login link
+4. Open the link, login to iVAS, go to SMS page
+5. Click "Capture Session"
+6. Bot sends you config.json on Telegram automatically
+7. Forward config.json to your main bot
+"""
 import asyncio
-import re
-import cloudscraper
-from bs4 import BeautifulSoup
+import logging
+import json
+import os
+import threading
 from datetime import datetime
-from telegram import Bot
+from flask import Flask, request, jsonify, Response
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import TelegramError
 
 # ══════════════════════════════════════════════
-#   CONFIG
+#  CONFIG
 # ══════════════════════════════════════════════
-IVAS_EMAIL    = "larrymullenjr3@gmail.com"
-IVAS_PASSWORD = "larry123@"
-BOT_TOKEN     = "8291963800:AAErU7MDzn-hPrL_1D69TDgMdp949XrzeOY"
-ADMIN_ID      = "7578254597"
-GROUP_CHAT_ID = "-1003656538385"
-POLL_INTERVAL = 30
+SETUP_BOT_TOKEN = "8291963800:AAErU7MDzn-hPrL_1D69TDgMdp949XrzeOY"  # Same bot token
+ADMIN_ID        = "7578254597"
+PORT            = int(os.getenv("PORT", 5000))
+# Your Render URL — update this after first deploy
+RENDER_URL      = os.getenv("RENDER_URL", "https://your-app.onrender.com")
 # ══════════════════════════════════════════════
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-BASE_URL = "https://www.ivasms.com"
-SMS_URL  = f"{BASE_URL}/portal/live/my_sms"
+app  = Flask(__name__)
+bot  = Bot(token=SETUP_BOT_TOKEN)
+
+# Store captured sessions in memory
+sessions = {}
+
+HTML_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+    <title>iVAS Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: Arial, sans-serif; background: #1a1a2e; color: #eee; padding: 15px; }}
+        h1 {{ color: #e94560; margin-bottom: 10px; font-size: 20px; }}
+        .card {{ background: #16213e; border-radius: 10px; padding: 15px; margin: 10px 0; }}
+        .step {{ border-left: 3px solid #e94560; padding: 8px 12px; margin: 6px 0; font-size: 14px; }}
+        button {{ background: #e94560; color: white; border: none; padding: 14px; border-radius: 8px; cursor: pointer; font-size: 16px; width: 100%; margin: 6px 0; font-weight: bold; }}
+        button.blue {{ background: #0f3460; }}
+        button:active {{ opacity: 0.8; }}
+        #status {{ padding: 12px; border-radius: 8px; margin: 8px 0; font-size: 14px; text-align: center; }}
+        .ok {{ background: #064e3b; color: #4ade80; }}
+        .waiting {{ background: #1c1c00; color: #facc15; }}
+        .error {{ background: #450a0a; color: #f87171; }}
+        iframe {{ width: 100%; height: 450px; border: 2px solid #e94560; border-radius: 8px; margin: 8px 0; }}
+        #log {{ background: #0d0d1a; padding: 8px; border-radius: 6px; font-family: monospace; font-size: 11px; max-height: 120px; overflow-y: auto; margin-top: 8px; }}
+    </style>
+</head>
+<body>
+    <h1>🔧 iVAS Session Capture</h1>
+    <div class="card">
+        <div class="step">1️⃣ Login to iVAS in the frame below</div>
+        <div class="step">2️⃣ Click "Go to SMS Page"</div>
+        <div class="step">3️⃣ Click "Capture & Send to Telegram"</div>
+    </div>
+
+    <iframe id="frame" src="https://www.ivasms.com/login"></iframe>
+
+    <button class="blue" onclick="gotoSMS()">📨 Go to SMS Page</button>
+    <button onclick="capture()">🎯 Capture & Send to Telegram</button>
+
+    <div id="status" class="waiting">⏳ Login to iVAS above, then capture</div>
+    <div id="log"></div>
+
+<script>
+var SESSION_ID = "{session_id}";
+var ajaxCalls = [];
+
+function addLog(msg) {{
+    var el = document.getElementById('log');
+    el.innerHTML += '<div>' + new Date().toLocaleTimeString() + ' — ' + msg + '</div>';
+    el.scrollTop = el.scrollHeight;
+}}
+
+function gotoSMS() {{
+    document.getElementById('frame').src = 'https://www.ivasms.com/portal/live/my_sms';
+    addLog('Navigating to SMS page...');
+}}
+
+// Intercept XHR to catch AJAX calls
+var origOpen = XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open = function(method, url) {{
+    if (url && url.toString().includes('ivasms')) {{
+        addLog('XHR: ' + method + ' ' + url);
+        ajaxCalls.push({{method: method, url: url.toString()}});
+    }}
+    return origOpen.apply(this, arguments);
+}};
+
+// Intercept fetch
+var origFetch = window.fetch;
+window.fetch = function(url, opts) {{
+    opts = opts || {{}};
+    var urlStr = (typeof url === 'string') ? url : url.toString();
+    if (urlStr.includes('ivasms')) {{
+        addLog('Fetch: ' + (opts.method||'GET') + ' ' + urlStr);
+        ajaxCalls.push({{method: opts.method||'GET', url: urlStr}});
+    }}
+    return origFetch.apply(this, arguments);
+}};
+
+function getCookies() {{
+    var cookies = {{}};
+    document.cookie.split(';').forEach(function(c) {{
+        var parts = c.trim().split('=');
+        if (parts.length >= 2) {{
+            cookies[parts[0].trim()] = parts.slice(1).join('=');
+        }}
+    }});
+    return cookies;
+}}
+
+function capture() {{
+    var cookies = getCookies();
+    var data = {{
+        session_id: SESSION_ID,
+        cookies: cookies,
+        ajax_calls: ajaxCalls,
+        timestamp: new Date().toISOString()
+    }};
+
+    addLog('Cookies: ' + JSON.stringify(Object.keys(cookies)));
+    addLog('AJAX calls: ' + ajaxCalls.length);
+
+    document.getElementById('status').className = 'waiting';
+    document.getElementById('status').textContent = '⏳ Sending to Telegram...';
+
+    fetch('/capture', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify(data)
+    }})
+    .then(function(r) {{ return r.json(); }})
+    .then(function(resp) {{
+        if (resp.success) {{
+            document.getElementById('status').className = 'ok';
+            document.getElementById('status').textContent = '✅ ' + resp.message;
+            addLog('✅ Done! Check your Telegram.');
+        }} else {{
+            document.getElementById('status').className = 'error';
+            document.getElementById('status').textContent = '❌ ' + resp.message;
+        }}
+    }})
+    .catch(function(e) {{
+        document.getElementById('status').className = 'error';
+        document.getElementById('status').textContent = '❌ Error: ' + e;
+    }});
+}}
+
+// Monitor iframe
+setInterval(function() {{
+    try {{
+        var url = document.getElementById('frame').contentWindow.location.href;
+        if (url.includes('/portal')) {{
+            document.getElementById('status').className = 'ok';
+            document.getElementById('status').textContent = '✅ Logged in! Now go to SMS page then capture.';
+        }}
+    }} catch(e) {{}}
+}}, 1500);
+
+addLog('Ready. Login to iVAS in the frame above.');
+</script>
+</body>
+</html>
+"""
 
 
-# ──────────────────────────────────────────────
-#  EXTRACT OTP CODE FROM MESSAGE TEXT
-# ──────────────────────────────────────────────
-def extract_otp(message: str) -> str:
-    """Try to extract the numeric OTP code from the message text."""
-    # Match 4–8 digit numbers (most OTPs are in this range)
-    matches = re.findall(r'\b\d{4,8}\b', message)
-    if matches:
-        # Return the longest match (most likely the OTP)
-        return max(matches, key=len)
-    return "N/A"
+# ── Flask Routes ──────────────────────────────
+
+@app.route("/")
+def index():
+    return jsonify({"status": "iVAS Setup Bot is running", "usage": "Message /setup to the Telegram bot"})
 
 
-# ──────────────────────────────────────────────
-#  iVAS SMS CLIENT
-# ──────────────────────────────────────────────
-class IvasSmsClient:
-    def __init__(self):
-        self.scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-        self.logged_in = False
+@app.route("/setup/<session_id>")
+def setup_page(session_id):
+    html = HTML_PAGE.replace("{session_id}", session_id)
+    return Response(html, mimetype="text/html")
 
-    def _get_csrf(self, html: str):
-        soup = BeautifulSoup(html, "html.parser")
-        for name in ["_token", "csrf_token", "csrfmiddlewaretoken"]:
-            tag = soup.find("input", {"name": name})
-            if tag and tag.get("value"):
-                return tag.get("value")
-        meta = soup.find("meta", {"name": "csrf-token"})
-        if meta and meta.get("content"):
-            return meta.get("content")
-        return None
 
-    def login(self) -> bool:
+@app.route("/capture", methods=["POST"])
+def capture():
+    try:
+        data       = request.get_json()
+        session_id = data.get("session_id", "unknown")
+        cookies    = data.get("cookies", {})
+        ajax_calls = data.get("ajax_calls", [])
+
+        log.info("Capture received — session: %s | cookies: %s | ajax: %d",
+                 session_id, list(cookies.keys()), len(ajax_calls))
+
+        if not cookies:
+            return jsonify({"success": False, "message": "No cookies found. Make sure you are fully logged in to iVAS first."})
+
+        # Build config.json content
+        config = {
+            "cookies":    cookies,
+            "ajax_calls": ajax_calls,
+            "captured_at": data.get("timestamp", datetime.now().isoformat()),
+        }
+
+        config_json = json.dumps(config, indent=2)
+
+        # Send to Telegram asynchronously
+        threading.Thread(
+            target=send_config_to_telegram,
+            args=(session_id, config_json, cookies, ajax_calls)
+        ).start()
+
+        return jsonify({
+            "success": True,
+            "message": f"✅ Captured {len(cookies)} cookies! Sending config.json to your Telegram now..."
+        })
+
+    except Exception as e:
+        log.error("Capture error: %s", e)
+        return jsonify({"success": False, "message": str(e)})
+
+
+def send_config_to_telegram(session_id, config_json, cookies, ajax_calls):
+    """Send config.json file to Telegram admin."""
+    async def _send():
         try:
-            log.info("Loading login page...")
-            resp = self.scraper.get(f"{BASE_URL}/login", timeout=30)
-            resp.raise_for_status()
-
-            csrf = self._get_csrf(resp.text)
-            log.info("CSRF token: %s", "found" if csrf else "not found")
-
-            payload = {"email": IVAS_EMAIL, "password": IVAS_PASSWORD}
-            if csrf:
-                payload["_token"] = csrf
-
-            log.info("Submitting login form...")
-            login_resp = self.scraper.post(
-                f"{BASE_URL}/login",
-                data=payload,
-                headers={"Referer": f"{BASE_URL}/login"},
-                timeout=30,
-                allow_redirects=True,
+            # Send summary message
+            ajax_info = "\n".join([f"  [{c.get('method','?')}] `{c.get('url','?')}`" for c in ajax_calls[:5]])
+            msg = (
+                "✅ *iVAS Session Captured!*\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🍪 *Cookies:* {list(cookies.keys())}\n"
+                f"🔗 *AJAX calls:* {len(ajax_calls)}\n"
+                f"{ajax_info if ajax_info else '  None captured'}\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "📎 *config.json file below — save it and upload to your main bot folder on Render/GitHub*"
             )
+            await bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode="Markdown")
 
-            body_lower = login_resp.text.lower()
-
-            if any(w in body_lower for w in ["invalid", "incorrect", "wrong", "credentials", "these credentials"]):
-                log.error("Login failed: wrong credentials.")
-                self.logged_in = False
-                return False
-
-            if "/login" not in login_resp.url:
-                log.info("Login successful! Landed on: %s", login_resp.url)
-                self.logged_in = True
-                return True
-
-            log.warning("Still on /login but no error found. Proceeding cautiously.")
-            self.logged_in = True
-            return True
-
-        except Exception as e:
-            log.error("Login exception: %s", e)
-            self.logged_in = False
-            return False
-
-    def check_sms_page(self) -> bool:
-        try:
-            resp = self.scraper.get(SMS_URL, timeout=30)
-            if resp.status_code == 200 and "/login" not in resp.url:
-                log.info("SMS page accessible.")
-                return True
-            log.warning("SMS page not accessible. Status: %s, URL: %s", resp.status_code, resp.url)
-            return False
-        except Exception as e:
-            log.error("SMS page check error: %s", e)
-            return False
-
-    def get_otp_messages(self) -> list:
-        if not self.logged_in:
-            log.warning("Not logged in — re-logging in...")
-            if not self.login():
-                return []
-
-        try:
-            resp = self.scraper.get(SMS_URL, timeout=30)
-
-            if resp.status_code in (401, 403) or "/login" in resp.url:
-                log.warning("Session expired — re-logging in...")
-                self.logged_in = False
-                if not self.login():
-                    return []
-                resp = self.scraper.get(SMS_URL, timeout=30)
-
-            if resp.status_code != 200:
-                log.error("SMS page returned status %s", resp.status_code)
-                return []
-
-            return self._parse_html(resp.text)
-
-        except Exception as e:
-            log.error("OTP fetch error: %s", e)
-            return []
-
-    def _parse_html(self, html: str) -> list:
-        soup = BeautifulSoup(html, "html.parser")
-        messages = []
-
-        tables = soup.find_all("table")
-        log.info("Found %d table(s) on SMS page.", len(tables))
-
-        for table in tables:
-            rows = table.find_all("tr")
-            for row in rows[1:]:
-                cols = [td.get_text(strip=True) for td in row.find_all("td")]
-                if len(cols) >= 2 and cols[1]:
-                    messages.append({
-                        "phone_number": cols[0] if len(cols) > 0 else "",
-                        "otp_message":  cols[1] if len(cols) > 1 else "",
-                        "range":        cols[2] if len(cols) > 2 else "",
-                        "date":         cols[3] if len(cols) > 3 else "",
-                    })
-
-        log.info("Parsed %d OTP(s) from SMS page.", len(messages))
-        return messages
-
-
-# ──────────────────────────────────────────────
-#  TELEGRAM BOT
-# ──────────────────────────────────────────────
-class OtpForwarderBot:
-    def __init__(self):
-        self.bot = Bot(token=BOT_TOKEN)
-        self.ivas = IvasSmsClient()
-        self.seen = set()
-
-    async def send_to_admin(self, text: str):
-        try:
-            await self.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
-        except TelegramError as e:
-            log.error("Admin message error: %s", e)
-
-    async def send_to_group(self, text: str):
-        try:
-            await self.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown")
-        except TelegramError as e:
-            log.error("Group message error: %s", e)
-
-    def _fingerprint(self, msg: dict) -> str:
-        return f"{msg.get('phone_number', '')}|{msg.get('otp_message', '')}"
-
-    def _format_otp(self, msg: dict) -> str:
-        message = msg.get("otp_message", "N/A")
-        otp     = extract_otp(message)
-        return (
-            "🆕 *NEW OTP DETECTED*\n"
-            "==================\n"
-            "OTP received 📩\n\n"
-            f"*Message:* `{message}`\n\n"
-            f"*OTP:* `{otp}`"
-        )
-
-    async def send_startup_status(self, ivas_ok: bool, sms_ok: bool):
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        msg = (
-            "🤖 *iVAS OTP Bot — Startup Report*\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔐 *iVAS SMS Status:* {'✅' if ivas_ok else '❌'}\n"
-            f"📨 *SMS Page Status:* {'✅' if sms_ok else '❌'}\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 *Time:* `{now}`"
-        )
-        await self.send_to_admin(msg)
-
-    async def check_and_forward(self):
-        messages = self.ivas.get_otp_messages()
-        new = 0
-        for msg in messages:
-            fp = self._fingerprint(msg)
-            if fp not in self.seen and msg.get("otp_message"):
-                self.seen.add(fp)
-                await self.send_to_group(self._format_otp(msg))
-                new += 1
-                await asyncio.sleep(0.5)
-        if new:
-            log.info("Forwarded %d new OTP(s) to group.", new)
-        else:
-            log.info("No new OTPs this cycle.")
-
-    async def run(self):
-        log.info("Starting iVAS SMS OTP Bot...")
-
-        ivas_ok = self.ivas.login()
-        sms_ok  = self.ivas.check_sms_page() if ivas_ok else False
-
-        await self.send_startup_status(ivas_ok, sms_ok)
-
-        if not ivas_ok:
-            log.error("Login failed — bot stopped. Admin notified.")
-            await self.send_to_admin(
-                "🚫 *Bot has stopped.*\n"
-                "Login to iVAS SMS failed\\.\n"
-                "Please check your email and password\\."
+            # Send config.json as a file
+            import io
+            file_bytes = io.BytesIO(config_json.encode())
+            file_bytes.name = "config.json"
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=file_bytes,
+                filename="config.json",
+                caption="📁 Your config.json — upload this to your main bot on Render/GitHub"
             )
-            return
+            log.info("✅ config.json sent to Telegram successfully")
 
-        log.info("Bot running — polling every %ds.", POLL_INTERVAL)
+        except Exception as e:
+            log.error("Telegram send error: %s", e)
 
-        while True:
-            try:
-                await self.check_and_forward()
-            except Exception as e:
-                log.error("Unexpected error: %s", e)
-            await asyncio.sleep(POLL_INTERVAL)
+    asyncio.run(_send())
+
+
+# ── Telegram Bot Commands ─────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 *iVAS Setup Bot*\n\n"
+        "Use /setup to get your iVAS session capture link.\n"
+        "This will give you a `config.json` file for your main OTP bot.",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+
+    # Only allow admin
+    if user_id != str(ADMIN_ID):
+        await update.message.reply_text("❌ Unauthorized.")
+        return
+
+    import secrets
+    session_id = secrets.token_hex(8)
+    sessions[session_id] = {"user_id": user_id, "created": datetime.now().isoformat()}
+
+    link = f"{RENDER_URL}/setup/{session_id}"
+
+    await update.message.reply_text(
+        "🔧 *iVAS Session Capture*\n\n"
+        f"👉 Open this link:\n{link}\n\n"
+        "📋 *Steps:*\n"
+        "1. Login to iVAS in the page\n"
+        "2. Click 'Go to SMS Page'\n"
+        "3. Click 'Capture & Send to Telegram'\n"
+        "4. I'll send you `config.json` automatically ✅",
+        parse_mode="Markdown"
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Commands:*\n\n"
+        "/setup — Get iVAS capture link\n"
+        "/start — Welcome message\n"
+        "/help — This message",
+        parse_mode="Markdown"
+    )
+
+
+# ── Main ──────────────────────────────────────
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
+
+
+async def run_telegram():
+    application = Application.builder().token(SETUP_BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("setup", cmd_setup))
+    application.add_handler(CommandHandler("help", cmd_help))
+    log.info("Telegram bot started.")
+    await application.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(OtpForwarderBot().run())
+    log.info("=== iVAS Setup Bot starting ===")
+    log.info("Flask on port %d | Render URL: %s", PORT, RENDER_URL)
+
+    # Run Flask in background thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Run Telegram bot in main thread
+    asyncio.run(run_telegram())
